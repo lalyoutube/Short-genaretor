@@ -1,0 +1,91 @@
+from flask import Flask, request, jsonify
+import os
+import base64
+import uuid
+from huggingface_hub import InferenceClient
+
+app = Flask(__name__)
+
+HF_TOKEN = os.environ.get("HF_TOKEN")
+if not HF_TOKEN:
+    raise ValueError("HF_TOKEN environment variable not set")
+
+# Initialize clients
+hf_general_client = InferenceClient(token=HF_TOKEN)
+hf_novita_client = InferenceClient(provider="novita", token=HF_TOKEN)
+
+GPT_MODEL = "meta-llama/Meta-Llama-3-70B-Instruct"
+VIDEO_MODEL = "Wan-AI/Wan2.2-TI2V-5B"
+
+@app.route('/generate', methods=['POST'])
+def generate():
+    data = request.get_json()
+    topic = data.get('topic', '')
+    video_length_seconds = int(data.get('video_length', 60))
+    ratio = data.get('ratio', '9:16')
+    
+    # Create output directory
+    output_dir = "/tmp"
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Generate script
+    script = generate_script(topic, video_length_seconds)
+    if script.startswith("Error:"):
+        return jsonify({"status": "error", "message": script}), 500
+    
+    # Generate video
+    video_bytes = generate_video(script)
+    if isinstance(video_bytes, str) and video_bytes.startswith("Error:"):
+        return jsonify({"status": "error", "message": video_bytes}), 500
+    
+    # Save video to temporary file
+    video_filename = f"/tmp/generated_short_{uuid.uuid4().hex}.mp4"
+    with open(video_filename, "wb") as f:
+        f.write(video_bytes)
+    
+    # Read file and encode as base64
+    with open(video_filename, "rb") as f:
+        video_base64 = base64.b64encode(f.read()).decode('utf-8')
+    
+    # Cleanup
+    os.remove(video_filename)
+    
+    return jsonify({
+        "status": "success",
+        "generated_script": script,
+        "video_base64": video_base64
+    })
+
+def generate_script(topic, video_length_seconds):
+    prompt = (
+        f"Generate a concise, engaging, and viral YouTube Shorts script (max {video_length_seconds} seconds) "
+        f"on the topic: '{topic}'. Make it 'faceless' – no human faces. "
+        f"Focus on visually rich descriptions suitable for text-to-video generation (e.g., 'fast-paced animation', "
+        f"'text overlays', 'macro shots of objects', 'abstract visualizations'). "
+        f"Include a strong hook, 2-3 clear points, and a call to action. "
+        f"Ensure the script's visual cues are designed for a 9:16 vertical video format."
+    )
+    try:
+        script_response = hf_general_client.text_generation(
+            model=GPT_MODEL,
+            prompt=prompt,
+            max_new_tokens=400,
+            temperature=0.7,
+            top_p=0.9
+        )
+        return script_response.strip()
+    except Exception as e:
+        return f"Error during script generation: {str(e)}"
+
+def generate_video(script):
+    try:
+        video_bytes = hf_novita_client.text_to_video(
+            script,
+            model=VIDEO_MODEL,
+        )
+        return video_bytes
+    except Exception as e:
+        return f"Error during video generation: {str(e)}"
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', port=5000)
